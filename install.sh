@@ -5,20 +5,25 @@
 # 用途：在一台全新的 Ubuntu 22.04 / 24.04 VPS 上，一键部署 AdGuard Home，
 # 并按选择的模式提供明文或加密 DNS（DoH / DoT / DoQ）。
 #
-# 三种模式（运行后按菜单选择）：
+# 四种模式（运行后按菜单选择）：
 #   1 明文             ：只装 AdGuard Home，DNS 走 UDP/TCP 53，无加密。
 #   2 加密直连 DoH     ：AdGuard + acme.sh（Cloudflare DNS 验证）签证书
 #                        + nginx 反代 DoH，可选 sing-box VLESS+REALITY（443 端口）。
 #   3 加密经 Cloudflare Tunnel：
 #                        AdGuard + cloudflared 隧道，DoH 经隧道对外，
 #                        不需要源站证书、不需要 nginx、不暴露服务器 IP。
+#   4 零依赖加密       ：只需要一台 VPS。公网 IP 生成 sslip.io 域名，
+#                        Let's Encrypt HTTP-01 签证书 + nginx 反代 DoH；
+#                        直连走不通（80/443 被拦）时自动切 trycloudflare
+#                        快速隧道兜底。不需要域名、Cloudflare 账号、API Token、浏览器登录。
 #
 # 用法：
 #   curl -fsSL <raw-url>/install.sh | sudo bash
 #   或下载后：sudo bash install.sh
 #
 # 要求：Ubuntu 22.04 / 24.04，以 root 运行；模式 2 和 3 需要一个托管在
-# Cloudflare 的域名；模式 2 还需要一个有 DNS:Edit 权限的 Cloudflare API Token。
+# Cloudflare 的域名；模式 2 还需要一个有 DNS:Edit 权限的 Cloudflare API Token；
+# 模式 4 只需要一台有公网 IP 的 VPS，不需要域名和 Cloudflare 账号。
 #
 # 注意：本脚本不包含任何真实域名、IP、Token、密码或 UUID，
 # 所有参数都在安装时由你输入；生成的密钥只写进本地凭据文件，不会上传到任何地方。
@@ -52,10 +57,13 @@ DOH_QUERY_B64="AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"
 
 MODE=""
 MODE_TEXT=""
+MODE4_PATH=""
 TLS_ENABLED="false"
 TLS_SERVER_NAME=""
 TLS_CERT=""
 TLS_KEY=""
+DOT_PORT="6789"
+DOQ_PORT="6789"
 SINGBOX_INSTALLED="n"
 TUNNEL_ID=""
 
@@ -90,11 +98,36 @@ server_ip() {
     hostname -I 2>/dev/null | awk '{print $1}'
 }
 
+is_private_ip() {
+    # 私网 / 回环 / 链路本地地址不能用来生成 sslip.io 域名
+    [[ "$1" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|127\.|169\.254\.|0\.) ]]
+}
+
+public_ip() {
+    # 返回本机公网 IPv4，失败返回 1。先问外网 IP 查询服务（多个备用），
+    # 再兜底看本机网卡 IP（只有它是公网 IP 时才采用）。
+    local ip="" svc=""
+    for svc in "https://api.ipify.org" "https://ifconfig.me/ip" "https://icanhazip.com"; do
+        ip="$(curl -fsSL --noproxy '*' --max-time 10 "$svc" 2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! is_private_ip "$ip"; then
+            printf '%s' "$ip"
+            return 0
+        fi
+    done
+    ip="$(server_ip)"
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! is_private_ip "$ip"; then
+        printf '%s' "$ip"
+        return 0
+    fi
+    return 1
+}
+
 wait_for_http() {
     # wait_for_http <url> <超时秒数>：200 或 302 即视为就绪
     local url="$1" timeout="${2:-60}" i=0 code=""
     while (( i < timeout )); do
-        code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 3 "$url" 2>/dev/null || echo 000)"
+        # --noproxy '*'：检查的是本机服务，必须直连，不能走环境里可能存在的代理。
+        code="$(curl -sk --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 3 "$url" 2>/dev/null || echo 000)"
         if [[ "$code" == "200" || "$code" == "302" ]]; then
             return 0
         fi
@@ -165,8 +198,8 @@ ask_yes_no() {
 choose_mode() {
     if [[ -n "${AGH_MODE:-}" ]]; then
         case "$AGH_MODE" in
-            1|2|3) MODE="$AGH_MODE"; return 0 ;;
-            *) die "环境变量 AGH_MODE 只能是 1、2 或 3，当前是：$AGH_MODE" ;;
+            1|2|3|4) MODE="$AGH_MODE"; return 0 ;;
+            *) die "环境变量 AGH_MODE 只能是 1、2、3 或 4，当前是：$AGH_MODE" ;;
         esac
     fi
     echo
@@ -184,13 +217,19 @@ choose_mode() {
     echo "     AdGuard + cloudflared 隧道，DoH 经隧道对外，不暴露服务器 IP，"
     echo "     不需要源站证书、不需要 nginx。"
     echo "     适合：直连 443 被运营商干扰、或不想暴露服务器 IP 的情况。"
+    echo
+    echo "  4) 零依赖加密（直连优先，失败走快速隧道）"
+    echo "     只需要一台 VPS：公网 IP 生成 sslip.io 域名，Let's Encrypt"
+    echo "     HTTP-01 签证书 + nginx 反代 DoH；直连不通（80/443 被拦）时"
+    echo "     自动切 trycloudflare 快速隧道兜底。"
+    echo "     适合：没有域名、没有 Cloudflare 账号，只想一条命令装好加密 DNS。"
     echo "=================================================="
     local c=""
     while true; do
-        read -rp "请输入 1/2/3: " c
+        read -rp "请输入 1/2/3/4: " c
         case "$c" in
-            1|2|3) MODE="$c"; return 0 ;;
-            *) warn "请输入 1、2 或 3。" ;;
+            1|2|3|4) MODE="$c"; return 0 ;;
+            *) warn "请输入 1、2、3 或 4。" ;;
         esac
     done
 }
@@ -213,8 +252,8 @@ prompt_common() {
     if ! [[ "$AGH_ADMIN_PORT" =~ ^[0-9]+$ ]] || (( AGH_ADMIN_PORT < 1 || AGH_ADMIN_PORT > 65535 )); then
         die "管理面板端口必须是 1-65535 的数字：$AGH_ADMIN_PORT"
     fi
-    if [[ "$AGH_ADMIN_PORT" == "53" || "$AGH_ADMIN_PORT" == "8090" || "$AGH_ADMIN_PORT" == "6789" ]]; then
-        die "管理面板端口不能是 53 / 8090 / 6789，这些端口要留给 DNS 用。"
+    if [[ "$AGH_ADMIN_PORT" == "53" || "$AGH_ADMIN_PORT" == "8090" || "$AGH_ADMIN_PORT" == "6789" || "$AGH_ADMIN_PORT" == "853" ]]; then
+        die "管理面板端口不能是 53 / 8090 / 6789 / 853，这些端口要留给 DNS 用。"
     fi
     ask AGH_UPSTREAM "上游 DNS（逗号分隔，可回车用默认）" "https://dns10.quad9.net/dns-query,1.1.1.1"
 }
@@ -258,10 +297,25 @@ prompt_mode3() {
     validate_doh_host
 }
 
+prompt_mode4() {
+    echo
+    info "模式 4 不需要域名、Cloudflare 账号、API Token 或浏览器登录，"
+    info "只需要这台 VPS：先尝试用 <公网IP>.sslip.io 直连签发 Let's Encrypt 证书，"
+    info "直连走不通（80/443 被拦）时自动切到 trycloudflare 快速隧道兜底。"
+    warn "快速隧道的域名每次重启服务会变，变了要更新客户端配置；"
+    warn "想要固定域名请用模式 3（需要 Cloudflare 账号）。"
+    # AGH_FORCE_TUNNEL=1（或 y）强制直接走隧道，跳过直连尝试；不设置则提问。
+    ask_yes_no AGH_FORCE_TUNNEL "是否跳过直连，直接走快速隧道" "n"
+    case "${AGH_FORCE_TUNNEL:-n}" in
+        1|y|Y|yes|YES) AGH_FORCE_TUNNEL="y" ;;
+        *) AGH_FORCE_TUNNEL="n" ;;
+    esac
+}
+
 # ---------------------------------------------------------------- AdGuard Home
 install_adguard() {
-    info "安装依赖：curl ca-certificates gnupg socat apache2-utils dnsutils iproute2 ..."
-    apt_install curl ca-certificates gnupg lsb-release socat apache2-utils dnsutils iproute2
+    info "安装依赖：curl ca-certificates gnupg socat apache2-utils dnsutils iproute2 cron ..."
+    apt_install curl ca-certificates gnupg lsb-release socat apache2-utils dnsutils iproute2 cron
 
     if [[ ! -x "$AGH_BIN" ]]; then
         info "安装 AdGuard Home（官方安装脚本）..."
@@ -303,6 +357,8 @@ write_agh_config() {
     #   模式 1：TLS 关闭；模式 2：TLS 开 + acme.sh 证书路径（续期后 AdGuard 会自动重读，
     #   证书路径直接引用 acme.sh 的文件）；模式 3：TLS 开 + 不填证书路径，
     #   AdGuard 启动时自动生成自签名证书（隧道用 noTLSVerify 连接，不校验它）。
+    #   模式 4 直连：同模式 2；模式 4 隧道兜底：同模式 3（自签名证书）。
+    #   DOT_PORT / DOQ_PORT 默认 6789（模式 1/2/3），模式 4 用标准端口 853。
     local users_block=""
     if [[ -f "$AGH_CONF" ]]; then
         cp -a "$AGH_CONF" "${AGH_CONF}.bak.$(date +%Y%m%d%H%M%S)"
@@ -359,8 +415,8 @@ tls:
   server_name: ${TLS_SERVER_NAME}
   force_https: false
   port_https: 8090
-  port_dns_over_tls: 6789
-  port_dns_over_quic: 6789
+  port_dns_over_tls: ${DOT_PORT}
+  port_dns_over_quic: ${DOQ_PORT}
   certificate_path: ${TLS_CERT}
   private_key_path: ${TLS_KEY}
 querylog:
@@ -405,8 +461,14 @@ start_adguard() {
 install_acme() {
     if [[ ! -x "$HOME/.acme.sh/acme.sh" ]]; then
         info "安装 acme.sh..."
-        curl -fsSL https://get.acme.sh | sh -s email="$AGH_CF_EMAIL" \
-            || die "acme.sh 安装失败，请检查网络。"
+        # 模式 2 有邮箱（ZeroSSL 注册用），模式 4 没有邮箱就不传（Let's Encrypt 不需要）。
+        if [[ -n "${AGH_CF_EMAIL:-}" ]]; then
+            curl -fsSL https://get.acme.sh | sh -s email="$AGH_CF_EMAIL" \
+                || die "acme.sh 安装失败，请检查网络。"
+        else
+            curl -fsSL https://get.acme.sh | sh \
+                || die "acme.sh 安装失败，请检查网络。"
+        fi
     else
         info "检测到已安装的 acme.sh，跳过安装。"
     fi
@@ -443,6 +505,58 @@ issue_cert() {
         --reloadcmd "nginx -t && systemctl reload nginx; systemctl restart AdGuardHome" \
         || die "安装证书到 /etc/ssl/${AGH_DOH_HOST}/ 失败。"
     ok "证书已签发并安装到 /etc/ssl/${AGH_DOH_HOST}/，续期会自动重载 nginx 并重启 AdGuard。"
+}
+
+write_nginx_http01_vhost() {
+    # 模式 4 专用：只监听 80，专门给 Let's Encrypt HTTP-01 验证用。
+    # 用 webroot 方式签发（而不是 standalone），续期时 nginx 不用停，
+    # 证书到期 acme.sh 能直接续上；签完证书后 write_nginx_vhost 再补 443 的 DoH 反代。
+    apt_install nginx
+    mkdir -p /var/www/html
+    cat > /etc/nginx/conf.d/adguard-http01.conf <<EOF
+# Let's Encrypt HTTP-01 验证（由一键部署脚本生成，模式 4）
+server {
+    listen 80;
+    server_name ${AGH_DOH_HOST};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 404;
+    }
+}
+EOF
+    nginx -t || die "nginx 配置测试失败（nginx -t 未通过），请检查 /etc/nginx/conf.d/adguard-http01.conf。"
+    systemctl enable nginx >/dev/null 2>&1 || true
+    systemctl reload nginx || systemctl restart nginx || die "nginx 重载失败。"
+    ok "nginx HTTP-01 验证站点已生效（80 端口）。"
+}
+
+issue_cert_http01() {
+    # 模式 4 专用：Let's Encrypt HTTP-01 签发 sslip.io 域名的真实证书。
+    # 返回 0 = 签发成功；返回 1 = 失败（调用方自动切快速隧道兜底），不要直接 die。
+    # CA 固定 Let's Encrypt，不用 ZeroSSL、不需要邮箱和 API Token。
+    # 要求：域名能解析到本机、80 端口能从外网访问（Let's Encrypt 验证服务器要连进来）。
+    "$ACME" --set-default-ca --server letsencrypt \
+        || { warn "设置默认 CA（Let's Encrypt）失败。"; return 1; }
+
+    info "签发证书（Let's Encrypt HTTP-01 验证，域名：$AGH_DOH_HOST，需 80 端口可达）..."
+    if ! "$ACME" --issue --webroot /var/www/html -d "$AGH_DOH_HOST" --ecc; then
+        warn "证书签发失败。常见原因：80 端口被运营商/防火墙拦截，或域名解析不到本机。"
+        return 1
+    fi
+
+    mkdir -p "/etc/ssl/${AGH_DOH_HOST}"
+    "$ACME" --install-cert -d "$AGH_DOH_HOST" --ecc \
+        --cert-file "/etc/ssl/${AGH_DOH_HOST}/cert.cer" \
+        --key-file "/etc/ssl/${AGH_DOH_HOST}/private.key" \
+        --fullchain-file "/etc/ssl/${AGH_DOH_HOST}/fullchain.cer" \
+        --reloadcmd "nginx -t && systemctl reload nginx; systemctl restart AdGuardHome" \
+        || { warn "安装证书到 /etc/ssl/${AGH_DOH_HOST}/ 失败。"; return 1; }
+    ok "证书已签发并安装到 /etc/ssl/${AGH_DOH_HOST}/，续期会自动重载 nginx 并重启 AdGuard。"
+    return 0
 }
 
 write_nginx_vhost() {
@@ -660,6 +774,68 @@ setup_tunnel() {
     chmod 600 "$CRED_FILE"
 }
 
+# ---------------------------------------------------------------- 模式 4：trycloudflare 快速隧道兜底
+setup_quick_tunnel() {
+    # 模式 4 兜底：免费快速隧道，无需登录、无需账号。
+    # 返回 0 = 隧道已启动并拿到域名（AGH_DOH_HOST 被设为 trycloudflare 域名，
+    # MODE4_PATH 被设为 tunnel）；返回 1 = 失败（调用方报错退出）。
+    # 注意：快速隧道域名每次重启服务会变，变了要更新客户端配置；
+    # 想要固定域名请用模式 3（需要 Cloudflare 账号）。
+    install_cloudflared
+    cat > /etc/systemd/system/adguard-quick-tunnel.service <<EOF
+# AdGuard DoH 快速隧道（由一键部署脚本生成，模式 4 兜底）
+[Unit]
+Description=AdGuard DoH quick tunnel (trycloudflare)
+After=network-online.target AdGuardHome.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel --url https://127.0.0.1:8090 --no-tls-verify
+Restart=always
+RestartSec=5
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable adguard-quick-tunnel >/dev/null 2>&1 || true
+    systemctl restart adguard-quick-tunnel \
+        || { warn "快速隧道服务启动失败，请查看：journalctl -u adguard-quick-tunnel -n 100"; return 1; }
+
+    # 等 cloudflared 在日志里打出分配的域名（形如 https://xxx.trycloudflare.com），最多等 90 秒。
+    # 取最新的一条：服务每次重启都会重新打一条，旧的域名已失效，不能用。
+    # 排除 api.trycloudflare.com：那是 cloudflared 请求隧道的 API 端点（出错时也会出现在日志里），不是分配的隧道域名。
+    local host="" i=0
+    for i in $(seq 1 45); do
+        host="$(journalctl -u adguard-quick-tunnel --no-pager -n 200 2>/dev/null \
+            | grep -oE 'https://[A-Za-z0-9-]+\.trycloudflare\.com' \
+            | grep -v 'https://api\.trycloudflare\.com' \
+            | tail -1 | sed 's#https://##' || true)"
+        if [[ -n "$host" ]]; then break; fi
+        sleep 2
+    done
+    if [[ -z "$host" ]]; then
+        warn "快速隧道启动后 90 秒内没有拿到 trycloudflare 域名，请查看：journalctl -u adguard-quick-tunnel -n 100"
+        return 1
+    fi
+    AGH_DOH_HOST="$host"
+    MODE4_PATH="tunnel"
+
+    {
+        echo "# trycloudflare 快速隧道（模式 4 兜底，生成时间：$(date -Is)）"
+        echo "quick_tunnel_host=${host}"
+        echo "doh_host=${host}"
+        echo "doh_url=https://${host}/dns-query"
+    } >> "$CRED_FILE"
+    chmod 600 "$CRED_FILE"
+    ok "快速隧道已运行：https://${host}/dns-query"
+    warn "注意：快速隧道域名每次重启 adguard-quick-tunnel 服务会变，变了要更新客户端配置；想要固定域名请用模式 3。"
+    return 0
+}
+
 # ---------------------------------------------------------------- 验证与汇总
 check_doh_dns() {
     # 模式 2 才需要：DoH 域名必须解析到本机，否则客户端连不上
@@ -712,7 +888,7 @@ print_summary() {
     echo "明文 DNS：${ip}（UDP/TCP 53）"
     if [[ "$MODE" == "2" ]]; then
         echo "DoH 地址：https://${AGH_DOH_HOST}/dns-query"
-        echo "DoT 地址：tls://${AGH_DOH_HOST}:6789"
+        echo "DoT 地址：tls://${AGH_DOH_HOST}:${DOT_PORT}"
         echo "证书目录：/etc/ssl/${AGH_DOH_HOST}/（acme.sh 自动续期并重载）"
         if [[ "$SINGBOX_INSTALLED" == "y" ]]; then
             echo "sing-box VLESS+REALITY：443 端口（非 REALITY 握手回落到 nginx DoH）"
@@ -722,6 +898,18 @@ print_summary() {
         echo "DoH 地址：https://${AGH_DOH_HOST}/dns-query（经 Cloudflare Tunnel）"
         echo "隧道：${AGH_TUNNEL_NAME}（ID：${TUNNEL_ID:-未知}）"
         echo "隧道配置：$HOME/.cloudflared/config.yml"
+    fi
+    if [[ "$MODE" == "4" ]]; then
+        if [[ "$MODE4_PATH" == "direct" ]]; then
+            echo "DoH 地址：https://${AGH_DOH_HOST}/dns-query（直连）"
+            echo "DoT 地址：tls://${AGH_DOH_HOST}:853"
+            echo "DoQ 地址：quic://${AGH_DOH_HOST}:853"
+            echo "证书目录：/etc/ssl/${AGH_DOH_HOST}/（acme.sh 自动续期并重载）"
+        else
+            echo "DoH 地址：https://${AGH_DOH_HOST}/dns-query（经 trycloudflare 快速隧道）"
+            echo "快速隧道服务：adguard-quick-tunnel.service（查看日志：journalctl -u adguard-quick-tunnel -n 100）"
+            echo "注意：快速隧道域名每次重启服务会变，变了要更新客户端配置；想要固定域名请用模式 3。"
+        fi
     fi
     echo "凭据文件：$CRED_FILE（权限 600，只在本地）"
     echo "AdGuard 配置：$AGH_CONF"
@@ -795,6 +983,74 @@ main() {
             install_cloudflared
             setup_tunnel
             verify_doh || true
+            ;;
+        4)
+            MODE_TEXT="4 零依赖加密（直连优先，失败走快速隧道）"
+            prompt_mode4
+            DOT_PORT="853"
+            DOQ_PORT="853"
+            install_adguard
+            if [[ "$AGH_FORCE_TUNNEL" == "y" ]]; then
+                # 强制走隧道：AdGuard 开 TLS 但不填证书路径（自签名），
+                # 快速隧道用 --no-tls-verify 连本机 8090。
+                TLS_ENABLED="true"
+                TLS_SERVER_NAME="adguard"
+                TLS_CERT=""
+                TLS_KEY=""
+                write_agh_config
+                start_adguard
+                setup_quick_tunnel || die "快速隧道启动失败：请检查网络与日志 journalctl -u adguard-quick-tunnel -n 100。"
+                verify_doh || die "快速隧道 DoH 验证失败（https://${AGH_DOH_HOST}/dns-query 未返回有效 DNS 答案）。请检查 journalctl -u AdGuardHome -n 100 与 journalctl -u adguard-quick-tunnel -n 100。"
+            else
+                # 直连：公网 IP -> sslip.io 域名 -> Let's Encrypt HTTP-01 签证书。
+                local pub_ip=""
+                pub_ip="$(public_ip)" || die "无法获取本机公网 IP（外网 IP 查询服务连不上，且本机网卡 IP 不是公网 IP）。模式 4 需要公网 IP 生成 sslip.io 域名；如果这台 VPS 没有公网 IP，请用模式 1 或模式 3。"
+                AGH_DOH_HOST="$(printf '%s' "$pub_ip" | tr '.' '-').sslip.io"
+                info "本机公网 IP：$pub_ip，直连 DoH 域名：$AGH_DOH_HOST（sslip.io 自动解析到本机，无需注册域名）。"
+                # sslip.io 是通配解析，正常应立即解析到本机 IP；先轻量检查一次，
+                # 解析不对只警告（证书签发本身会再校验一次，失败会走隧道兜底）。
+                local resolved=""
+                resolved="$(dig +short "$AGH_DOH_HOST" A 2>/dev/null | head -1 || true)"
+                if [[ "$resolved" != "$pub_ip" ]]; then
+                    warn "域名 $AGH_DOH_HOST 目前解析到 ${resolved:-（无结果）}，不是本机公网 IP $pub_ip，证书签发可能失败。"
+                fi
+                TLS_ENABLED="true"
+                TLS_SERVER_NAME="$AGH_DOH_HOST"
+                TLS_CERT="/root/.acme.sh/${AGH_DOH_HOST}_ecc/fullchain.cer"
+                TLS_KEY="/root/.acme.sh/${AGH_DOH_HOST}_ecc/${AGH_DOH_HOST}.key"
+                install_acme
+                local direct_ok="n"
+                write_nginx_http01_vhost
+                if issue_cert_http01; then
+                    write_agh_config
+                    start_adguard
+                    write_nginx_vhost "443"
+                    if verify_doh; then
+                        direct_ok="y"
+                        MODE4_PATH="direct"
+                        {
+                            echo "# 直连 DoH（模式 4，生成时间：$(date -Is)）"
+                            echo "doh_host=${AGH_DOH_HOST}"
+                            echo "doh_url=https://${AGH_DOH_HOST}/dns-query"
+                        } >> "$CRED_FILE"
+                        chmod 600 "$CRED_FILE"
+                    else
+                        warn "直连 DoH 验证失败（https://${AGH_DOH_HOST}/dns-query 未返回有效答案），可能 443 被运营商拦截，自动切到快速隧道兜底。"
+                    fi
+                else
+                    warn "证书签发失败，自动切到快速隧道兜底（不需要 80/443 直连）。"
+                    # 证书没拿到：AdGuard 改用自签名证书（TLS 开，证书路径留空），
+                    # 快速隧道用 --no-tls-verify 连本机 8090。
+                    TLS_CERT=""
+                    TLS_KEY=""
+                    write_agh_config
+                    start_adguard
+                fi
+                if [[ "$direct_ok" != "y" ]]; then
+                    setup_quick_tunnel || die "直连和快速隧道都失败了：直连失败原因见上面的证书/验证提示；隧道失败请检查 journalctl -u adguard-quick-tunnel -n 100。"
+                    verify_doh || die "直连和快速隧道都失败了：隧道已启动，但 DoH 验证未通过（https://${AGH_DOH_HOST}/dns-query 未返回有效 DNS 答案）。请检查 journalctl -u AdGuardHome -n 100 与 journalctl -u adguard-quick-tunnel -n 100。"
+                fi
+            fi
             ;;
         *)
             die "未知模式：$MODE"

@@ -2,15 +2,16 @@
 
 在一台全新的 Ubuntu 22.04 / 24.04 VPS 上，一键部署 AdGuard Home，并按选择的模式提供明文或加密 DNS（DoH / DoT / DoQ）。交互式安装：运行后选模式、填参数即可，不用手动改配置文件。
 
-## 三种模式
+## 四种模式
 
 | 模式 | 包含什么 | 什么时候选 |
 |------|---------|-----------|
 | **1 明文** | AdGuard Home，DNS 走 UDP/TCP 53，管理面板自定义端口，无加密 | 局域网 / 可信网络，或只想先跑起来试试 |
 | **2 加密直连 DoH** | AdGuard + acme.sh 证书（Cloudflare DNS 验证）+ nginx 反代 DoH，可选 sing-box VLESS+REALITY（443 端口，非 REALITY 握手回落到 nginx DoH） | 有 Cloudflare 托管域名，想直接用 443 提供加密 DNS |
 | **3 加密经 Cloudflare Tunnel** | AdGuard + cloudflared 隧道，DoH 经隧道对外，不暴露服务器 IP，不需要源站证书、不需要 nginx | 直连 443 被运营商干扰，或不想暴露服务器 IP |
+| **4 零依赖加密** | 只要一台 VPS：公网 IP 生成 sslip.io 域名，Let's Encrypt HTTP-01 签证书 + nginx 反代 DoH；直连不通（80/443 被拦）时自动切 trycloudflare 快速隧道兜底 | 没有域名、没有 Cloudflare 账号，只想一条命令装好加密 DNS |
 
-三种模式的 AdGuard 过滤、广告拦截、查询日志都一样，区别只在“客户端到 AdGuard 这一段走不走加密、走哪条路”。
+四种模式的 AdGuard 过滤、广告拦截、查询日志都一样，区别只在“客户端到 AdGuard 这一段走不走加密、走哪条路”。
 
 ## 前置条件
 
@@ -18,6 +19,7 @@
 - 模式 2 和 3：一个托管在 Cloudflare 的域名
 - 模式 2：一个有对应域名 **DNS:Edit** 权限的 Cloudflare API Token
 - 模式 3：部署过程中需要在浏览器里完成一次 Cloudflare 登录授权（`cloudflared tunnel login`）
+- 模式 4：什么都不用——不需要域名、不需要 Cloudflare 账号、不需要 API Token、不需要浏览器登录，只要这台 VPS 有公网 IP（直连签证书要 80 端口能从外网访问；80/443 被拦也没关系，会自动切快速隧道兜底）
 
 ## 一键安装
 
@@ -31,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/20051yy/adguard-doh-deploy/main/ins
 
 | 参数 | 说明 |
 |------|------|
-| 部署模式 | 1 明文 / 2 加密直连 DoH / 3 加密经 Cloudflare Tunnel |
+| 部署模式 | 1 明文 / 2 加密直连 DoH / 3 加密经 Cloudflare Tunnel / 4 零依赖加密 |
 | AdGuard 管理员用户名 | 默认 `admin` |
 | AdGuard 管理员密码 | 输入不回显，输两遍确认 |
 | AdGuard 管理面板端口 | 默认 `32450`（不是 3000） |
@@ -43,8 +45,9 @@ curl -fsSL https://raw.githubusercontent.com/20051yy/adguard-doh-deploy/main/ins
 | 是否安装 sing-box（模式 2） | 可选，VLESS+REALITY 占 443 端口 |
 | REALITY 伪装域名 SNI（模式 2 选了 sing-box 时） | 默认 `www.microsoft.com` |
 | 隧道名称（模式 3） | 默认 `adguard-doh`，不能含空格 |
+| 是否跳过直连直接走快速隧道（模式 4） | 默认 `n`；选 `y` 或环境变量 `AGH_FORCE_TUNNEL=1` 直接走 trycloudflare 隧道，不试直连 |
 
-所有参数也可以用环境变量预先传入（例如 `AGH_MODE=1 AGH_ADMIN_PASS=xxx sudo -E bash install.sh`），已设置的环境变量不会再提问。生成的 sing-box UUID、REALITY 密钥、隧道 ID 只写进本地凭据文件 `/root/adguard-doh-credentials`（权限 600），管理员密码和 Cloudflare API Token 不会写进这个文件。
+所有参数也可以用环境变量预先传入（例如 `AGH_MODE=1 AGH_ADMIN_PASS=xxx sudo -E bash install.sh`），已设置的环境变量不会再提问。生成的 sing-box UUID、REALITY 密钥、隧道 ID、trycloudflare 隧道域名只写进本地凭据文件 `/root/adguard-doh-credentials`（权限 600），管理员密码和 Cloudflare API Token 不会写进这个文件。
 
 ## 验证是否成功
 
@@ -74,10 +77,12 @@ curl -s -i 'https://<你的DoH域名>/dns-query?dns=AAABAAABAAAAAAAAB2V4YW1wbGUD
 - **模式 2 证书签发失败**：先确认 Cloudflare API Token 有该域名的 DNS:Edit 权限，且域名确实托管在该 Cloudflare 账号下。
 - **模式 2 的 DoH 连不上**：域名 A 记录必须指向这台 VPS 的公网 IP；等 DNS 生效后再测。
 - **模式 3 需要浏览器**：`cloudflared tunnel login` 会打印一个网址，在你自己的电脑浏览器里打开完成授权，再回终端按回车继续。
+- **模式 4 的 443 被拦怎么办**：不用管，脚本会自动处理。直连分两步验证：先签证书（要 80 端口能从外网访问），再验 443 的 DoH 查询；哪一步失败都会自动切到 trycloudflare 快速隧道兜底，最后打印出来的就是能用的 DoH 地址。如果两条路都失败，脚本会报错退出并说明原因，不会装完一个不能用的给你。
+- **trycloudflare 域名变了怎么办**：快速隧道（`*.trycloudflare.com`）的域名每次重启 `adguard-quick-tunnel` 服务会重新分配，变了之后客户端要把 DoH 地址改成新域名（新域名在 `/root/adguard-doh-credentials` 里，`quick_tunnel_host` 这一行，服务重启后重新运行一次脚本会刷新它）。想要固定不变的域名，请用模式 3（需要 Cloudflare 账号）。
 - **证书续期**：acme.sh 会自动续期，续期时自动重载 nginx 并重启 AdGuard；AdGuard 的证书直接引用 acme.sh 的文件路径，续期后无需手动改配置。
 - **sing-box 凭据**：UUID、REALITY 公钥/私钥、short_id 都在 `/root/adguard-doh-credentials` 里，脚本最后也会打印一次。
 
 ## 文件说明
 
-- `install.sh`：唯一的安装脚本，三个模式都在里面（可直接执行，也可 `source` 后单独调用里面的函数做测试）。
+- `install.sh`：唯一的安装脚本，四个模式都在里面（可直接执行，也可 `source` 后单独调用里面的函数做测试）。
 - `README.md`：本文件。
